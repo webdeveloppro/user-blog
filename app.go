@@ -3,19 +3,18 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/gorilla/mux"
-	_ "github.com/lib/pq"
+	v "github.com/webdeveloppro/validating"
 )
 
 // App holding routers and DB connection
 type App struct {
-	Router *mux.Router
-	DB     *sql.DB
+	Router  *mux.Router
+	Storage Storage
 }
 
 // User information
@@ -28,32 +27,11 @@ type User struct {
 }
 
 // NewApp will create new App instance and setup storage connection
-func New(host, user, password, dbname string) (a App, err error) {
+func NewApp(storage Storage) (a App, err error) {
 	a = App{}
-
-	if host == "" {
-		log.Fatal("Empty host string, setup DB_HOST env")
-		host = "localhost"
-	}
-
-	if user == "" {
-		return a, fmt.Errorf("Empty user string, setup DB_USER env")
-	}
-
-	if dbname == "" {
-		return a, fmt.Errorf("Empty dbname string, setup DB_DBNAME env")
-	}
-
-	connectionString :=
-		fmt.Sprintf("host=%s user=%s password='%s' dbname=%s sslmode=disable", host, user, password, dbname)
-
-	a.DB, err = sql.Open("postgres", connectionString)
-	if err != nil {
-		return a, fmt.Errorf("Cannot open postgresql connection: %v", err)
-	}
-
 	a.Router = mux.NewRouter()
 	a.initializeRoutes()
+	a.Storage = storage
 	return a, nil
 }
 
@@ -97,8 +75,8 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.DB.QueryRow("SELECT id, password FROM users WHERE email=$1", u.Email).Scan(&u.ID, &u.Password); err != nil {
-		errors["__error__"] = append(errors["__error__"], "email not found")
+	if err := a.Storage.GetUserByEmail(&u); err != nil {
+		errors["__error__"] = append(errors["__error__"], "email or password do not match")
 	}
 
 	if len(errors) > 0 {
@@ -125,39 +103,31 @@ func (a *App) signup(w http.ResponseWriter, r *http.Request) {
 		log.Fatalf("cannot decode signup body: %v", err)
 	}
 
-	errors := make(map[string]string)
-	if u.Email == "" {
-		errors["email"] = "Cannot be empty"
-	}
-
-	if u.Password == "" {
-		errors["password"] = "Cannot be empty"
-	}
+	errs := v.Validate(v.Schema{
+		v.F("email", &u.Email):       v.All(v.Nonzero("cannot be empty"), v.Len(4, 120, "length is not between 4 and 120")),
+		v.F("password", &u.Password): v.All(v.Nonzero("cannot be empty"), v.Len(4, 120, "length is not between 4 and 120")),
+	})
 
 	// We don't want to make database query if we already know email is not valid
-	if _, ok := errors["email"]; ok == false {
-		if err = a.DB.QueryRow("SELECT id, password FROM users WHERE email=$1",
-			u.Email,
-		).Scan(&u.ID, &u.Password); err != sql.ErrNoRows {
-			errors["email"] = err.Error()
+	if errs.HasField("email") == false {
+		err = a.Storage.GetUserByEmail(&u)
+		if err.Error() != sql.ErrNoRows.Error() {
+			errs.Extend(v.NewErrors("email", v.ErrUnrecognized, err.Error()))
 		}
 	}
 
-	if len(errors) > 0 {
-		respondWithJSON(w, r, http.StatusBadRequest, errors)
+	if len(errs) > 0 {
+		respondWithJSON(w, r, http.StatusBadRequest, errs.JSONErrors())
 		return
 	}
 
-	if err := a.DB.QueryRow("INSERT INTO users(email, password) VALUES($1, $2) RETURNING id",
-		u.Email,
-		u.Password,
-	).Scan(&u.ID); err != nil {
-		errors["__error__"] = "cannot create user, please try again in few minutes"
+	if err := a.Storage.CreateUser(&u); err != nil {
+		errs.Extend(v.NewErrors("__error__", v.ErrInvalid, "cannot create user, please try again in few minutes"))
 		log.Fatalf("insert users errors: %+v", err)
 	}
 
-	if len(errors) > 0 {
-		respondWithJSON(w, r, http.StatusBadRequest, errors)
+	if len(errs) > 0 {
+		respondWithJSON(w, r, http.StatusBadRequest, errs.JSONErrors())
 	} else {
 		respondWithJSON(w, r, http.StatusCreated, map[string]int32{"id": u.ID})
 	}
